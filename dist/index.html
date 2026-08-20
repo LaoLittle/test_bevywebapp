@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bevy Web App</title>
+    
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #262626;
+            user-select: none;
+        }
+
+        #bevy {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #start-overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: rgba(20, 20, 20, 0.85);
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            cursor: pointer;
+            z-index: 9999;
+            transition: opacity 0.3s ease;
+        }
+
+        #start-overlay h1 {
+            margin: 0 0 12px 0;
+            font-size: 24px;
+            font-weight: 500;
+        }
+
+        #start-overlay p {
+            margin: 0;
+            font-size: 14px;
+            color: #a0a0a0;
+        }
+    </style>
+<link rel="modulepreload" href="./manosabars-70207cbaa4010211.js" crossorigin="anonymous" integrity="sha384-Mj00ZMOKCYsyNPnqO49Pn77hsrOPNxEh8yVenWMe7NyeDYvxzGXEJvae1vprNCZB"><link rel="preload" href="./manosabars-70207cbaa4010211_bg.wasm" crossorigin="anonymous" integrity="sha384-wwnTeAR63HribEx8OhiC0nTgmOFuNAT+eU27FNUYvWN99g1ckq6mTyHM4ZPEEA09" as="fetch" type="application/wasm"></head>
+<body>
+    <div id="start-overlay">
+        <h1>点击任意位置开始</h1>
+        <p>Click anywhere to start</p>
+    </div>
+
+    <canvas id="bevy"></canvas>
+
+    <script>
+        const overlay = document.getElementById('start-overlay');
+
+        let started = false;
+
+        function startBevy() {
+            if (started || !window.wasmBindings?.start_bevy) {
+                return;
+            }
+
+            started = true;
+
+            window.wasmBindings.start_bevy();
+            overlay.style.opacity = '0';
+            overlay.style.pointerEvents = 'none';
+            setTimeout(() => {
+                overlay.remove();
+            }, 300);
+        }
+
+        overlay.addEventListener('pointerdown', startBevy);
+    </script>
+
+<script type="module">
+import init, * as bindings from './manosabars-70207cbaa4010211.js';
+const wasm = await init({ module_or_path: './manosabars-70207cbaa4010211_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>
