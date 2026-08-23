@@ -14,3 +14,4 @@ winit = "0.30.13"
 oxideav-mkv = { path = "oxideav-mkv" }
 oxideav-core = "0.1"
 rodio = "0.22.2"
+rayon = "1.12.0"

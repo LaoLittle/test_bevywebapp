@@ -41,7 +41,7 @@ var v_tex: texture_2d<f32>;
 var samp: sampler;
 
 struct ColorMatrix {
-    matrix: array<vec4<f32>, 3>,
+    matrix: mat3x3<f32>,
     offset: vec4<f32>,
 };
 
@@ -54,14 +54,12 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let u = textureSample(u_tex, samp, input.uv).r - 0.5;
     let v = textureSample(v_tex, samp, input.uv).r - 0.5;
     let yuv = vec3<f32>(y, u, v);
-    let r = dot(color_matrix.matrix[0].xyz, yuv) + color_matrix.offset.x;
-    let g = dot(color_matrix.matrix[1].xyz, yuv) + color_matrix.offset.y;
-    let b = dot(color_matrix.matrix[2].xyz, yuv) + color_matrix.offset.z;
+    let rgb = color_matrix.matrix * yuv + color_matrix.offset.xyz;
 
     return vec4(
-        clamp(r, 0.0, 1.0),
-        clamp(g, 0.0, 1.0),
-        clamp(b, 0.0, 1.0),
+        clamp(rgb.r, 0.0, 1.0),
+        clamp(rgb.g, 0.0, 1.0),
+        clamp(rgb.b, 0.0, 1.0),
         1.0,
     );
 }

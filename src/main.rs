@@ -2,16 +2,18 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use oxideav_core::{Demuxer, NullCodecResolver};
-use rav1d::{Decoder as Av1Decoder, PlanarImageComponent, Rav1dError};
+use rav1d::{Decoder as Av1Decoder, PlanarImageComponent, Rav1dError, Settings};
+use rayon::{join, prelude::*};
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, buffer::SamplesBuffer};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
+    dpi::LogicalSize,
     event::{ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
@@ -81,9 +83,26 @@ struct ShaderColorMatrix {
 impl From<ColorSpace> for ShaderColorMatrix {
     fn from(color_space: ColorSpace) -> Self {
         Self {
-            matrix: color_space
-                .yuv_to_rgb
-                .map(|row| [row[0], row[1], row[2], 0.0]),
+            matrix: [
+                [
+                    color_space.yuv_to_rgb[0][0],
+                    color_space.yuv_to_rgb[1][0],
+                    color_space.yuv_to_rgb[2][0],
+                    0.0,
+                ],
+                [
+                    color_space.yuv_to_rgb[0][1],
+                    color_space.yuv_to_rgb[1][1],
+                    color_space.yuv_to_rgb[2][1],
+                    0.0,
+                ],
+                [
+                    color_space.yuv_to_rgb[0][2],
+                    color_space.yuv_to_rgb[1][2],
+                    color_space.yuv_to_rgb[2][2],
+                    0.0,
+                ],
+            ],
             offset: [0.0, 0.0, 0.0, 0.0],
         }
     }
@@ -104,13 +123,21 @@ struct VideoFrame {
     image: Yuv420Image,
 }
 
+const CACHE_BLOCK_FRAMES: usize = 12;
+
+struct AudioChunk {
+    channels: u16,
+    sample_rate: u32,
+    samples: Vec<f32>,
+}
+
+struct CacheBlock {
+    frames: Vec<VideoFrame>,
+    audio: Vec<AudioChunk>,
+}
+
 enum DecodeEvent {
-    Frame(VideoFrame),
-    Audio {
-        channels: u16,
-        sample_rate: u32,
-        samples: Vec<f32>,
-    },
+    Block(CacheBlock),
     End,
     Error(String),
 }
@@ -121,9 +148,7 @@ impl Yuv420Image {
         let height = picture.height();
         let chroma_width = width.div_ceil(2);
         let chroma_height = height.div_ceil(2);
-        let copy_plane = |component: PlanarImageComponent, plane_width: u32, plane_height: u32| {
-            let source = picture.plane(component);
-            let stride = picture.stride(component) as usize;
+        let copy_plane = |source: Vec<u8>, stride: usize, plane_width: u32, plane_height: u32| {
             let mut output = vec![0; (plane_width * plane_height) as usize];
             for row in 0..plane_height as usize {
                 let source_start = row * stride;
@@ -133,12 +158,27 @@ impl Yuv420Image {
             }
             output
         };
+        let y_source = picture.plane(PlanarImageComponent::Y).to_vec();
+        let u_source = picture.plane(PlanarImageComponent::U).to_vec();
+        let v_source = picture.plane(PlanarImageComponent::V).to_vec();
+        let y_stride = picture.stride(PlanarImageComponent::Y) as usize;
+        let u_stride = picture.stride(PlanarImageComponent::U) as usize;
+        let v_stride = picture.stride(PlanarImageComponent::V) as usize;
+        let (y, (u, v)) = join(
+            || copy_plane(y_source, y_stride, width, height),
+            || {
+                join(
+                    || copy_plane(u_source, u_stride, chroma_width, chroma_height),
+                    || copy_plane(v_source, v_stride, chroma_width, chroma_height),
+                )
+            },
+        );
         Self {
             width,
             height,
-            y: copy_plane(PlanarImageComponent::Y, width, height),
-            u: copy_plane(PlanarImageComponent::U, chroma_width, chroma_height),
-            v: copy_plane(PlanarImageComponent::V, chroma_width, chroma_height),
+            y,
+            u,
+            v,
             chroma_width,
             chroma_height,
         }
@@ -146,28 +186,26 @@ impl Yuv420Image {
 }
 
 fn send_picture(
-    sender: &SyncSender<DecodeEvent>,
+    frames: &mut Vec<VideoFrame>,
     picture: rav1d::Picture,
     time_base: oxideav_core::TimeBase,
     first_timestamp: &mut Option<Duration>,
-) -> Result<(), String> {
+) {
     let timestamp = Duration::from_secs_f64(
         time_base
             .seconds_of(picture.timestamp().unwrap_or(0))
             .max(0.0),
     );
     let first = *first_timestamp.get_or_insert(timestamp);
-    sender
-        .send(DecodeEvent::Frame(VideoFrame {
-            timestamp: timestamp.saturating_sub(first),
-            image: Yuv420Image::from_picture(&picture),
-        }))
-        .map_err(|_| "playback window closed".to_string())
+    frames.push(VideoFrame {
+        timestamp: timestamp.saturating_sub(first),
+        image: Yuv420Image::from_picture(&picture),
+    });
 }
 
 fn start_stream(
     path: &str,
-) -> Result<(Receiver<DecodeEvent>, VideoFrame, VecDeque<DecodeEvent>), Box<dyn std::error::Error>>
+) -> Result<(Receiver<DecodeEvent>, CacheBlock, VecDeque<DecodeEvent>), Box<dyn std::error::Error>>
 {
     let input = BufReader::new(File::open(path)?);
     let mut demuxer = oxideav_mkv::demux::open_typed(Box::new(input), &NullCodecResolver)?;
@@ -197,8 +235,27 @@ fn start_stream(
     let decode_sender = sender.clone();
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
-            let mut decoder = Av1Decoder::new().map_err(|error| error.to_string())?;
+            let mut settings = Settings::new();
+            settings.set_n_threads(rayon::current_num_threads() as u32);
+            settings.set_max_frame_delay(CACHE_BLOCK_FRAMES as u32);
+            let mut decoder =
+                Av1Decoder::with_settings(&settings).map_err(|error| error.to_string())?;
             let mut first_timestamp = None;
+            let mut block_frames = Vec::with_capacity(CACHE_BLOCK_FRAMES);
+            let mut block_audio = Vec::new();
+            let flush_block =
+                |frames: &mut Vec<VideoFrame>, audio: &mut Vec<AudioChunk>| -> Result<(), String> {
+                    if !frames.is_empty() || !audio.is_empty() {
+                        decode_sender
+                            .send(DecodeEvent::Block(CacheBlock {
+                                frames: std::mem::take(frames),
+                                audio: std::mem::take(audio),
+                            }))
+                            .map_err(|_| "playback window closed".to_string())?;
+                        frames.reserve(CACHE_BLOCK_FRAMES);
+                    }
+                    Ok(())
+                };
             loop {
                 let packet = match demuxer.next_packet() {
                     Ok(packet) => packet,
@@ -215,11 +272,14 @@ fn start_stream(
                     loop {
                         while let Ok(picture) = decoder.get_picture() {
                             send_picture(
-                                &decode_sender,
+                                &mut block_frames,
                                 picture,
                                 video_time_base,
                                 &mut first_timestamp,
-                            )?;
+                            );
+                            if block_frames.len() >= CACHE_BLOCK_FRAMES {
+                                flush_block(&mut block_frames, &mut block_audio)?;
+                            }
                         }
                         match send_result {
                             Ok(()) => break,
@@ -230,27 +290,29 @@ fn start_stream(
                 } else if audio_index == Some(packet.stream_index) {
                     let samples = packet
                         .data
-                        .chunks_exact(2)
+                        .par_chunks_exact(2)
                         .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0)
                         .collect();
-                    decode_sender
-                        .send(DecodeEvent::Audio {
-                            channels: audio_channels,
-                            sample_rate: audio_rate,
-                            samples,
-                        })
-                        .map_err(|_| "playback window closed".to_string())?;
+                    block_audio.push(AudioChunk {
+                        channels: audio_channels,
+                        sample_rate: audio_rate,
+                        samples,
+                    });
+                    if block_frames.len() >= CACHE_BLOCK_FRAMES {
+                        flush_block(&mut block_frames, &mut block_audio)?;
+                    }
                 }
             }
             decoder.flush();
             while let Ok(picture) = decoder.get_picture() {
                 send_picture(
-                    &decode_sender,
+                    &mut block_frames,
                     picture,
                     video_time_base,
                     &mut first_timestamp,
-                )?;
+                );
             }
+            flush_block(&mut block_frames, &mut block_audio)?;
             decode_sender
                 .send(DecodeEvent::End)
                 .map_err(|_| "playback window closed".to_string())
@@ -260,15 +322,15 @@ fn start_stream(
         }
     });
     let mut pending_events = VecDeque::new();
-    let first_frame = loop {
+    let first_block = loop {
         match receiver.recv()? {
-            DecodeEvent::Frame(frame) => break frame,
-            event @ DecodeEvent::Audio { .. } => pending_events.push_back(event),
+            DecodeEvent::Block(block) if !block.frames.is_empty() => break block,
+            DecodeEvent::Block(block) => pending_events.push_back(DecodeEvent::Block(block)),
             DecodeEvent::End => return Err("output.mkv contains no decoded AV1 frames".into()),
             DecodeEvent::Error(error) => return Err(error.into()),
         }
     };
-    Ok((receiver, first_frame, pending_events))
+    Ok((receiver, first_block, pending_events))
 }
 
 struct Renderer {
@@ -573,20 +635,27 @@ struct App {
     receiver: Receiver<DecodeEvent>,
     pending_events: VecDeque<DecodeEvent>,
     current_frame: VideoFrame,
-    video_queue: VecDeque<VideoFrame>,
+    current_block_frames: VecDeque<VideoFrame>,
+    cache_blocks: VecDeque<CacheBlock>,
+    initial_audio: Vec<AudioChunk>,
     color_space: ColorSpace,
     audio_output: Option<MixerDeviceSink>,
     audio_player: Option<Player>,
     started_at: Instant,
     paused_at: Duration,
     paused: bool,
+    end_received: bool,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("Playing MKV video (av1 + pcm_s16le)"))
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("Playing MKV video (av1 + pcm_s16le)")
+                        .with_inner_size(LogicalSize::new(2560.0, 1440.0)),
+                )
                 .expect("failed to create window"),
         );
         let renderer = pollster::block_on(Renderer::new(
@@ -598,6 +667,8 @@ impl ApplicationHandler for App {
         let audio_player = Player::connect_new(audio_output.mixer());
         self.audio_output = Some(audio_output);
         self.audio_player = Some(audio_player);
+        let initial_audio = std::mem::take(&mut self.initial_audio);
+        self.queue_audio(initial_audio);
         self.window = Some(window);
         self.renderer = Some(renderer);
     }
@@ -610,50 +681,47 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut self.renderer {
-                    let elapsed = if self.paused {
-                        self.paused_at
-                    } else {
-                        self.started_at.elapsed()
-                    };
-                    loop {
-                        let event = self.pending_events.pop_front().or_else(|| {
-                            match self.receiver.try_recv() {
-                                Ok(event) => Some(event),
-                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
-                            }
-                        });
-                        let Some(event) = event else { break };
-                        match event {
-                            DecodeEvent::Frame(frame) => {
-                                self.video_queue.push_back(frame);
-                            }
-                            DecodeEvent::Audio {
-                                channels,
-                                sample_rate,
-                                samples,
-                            } => {
-                                if let Some(player) = &self.audio_player {
-                                    player.append(SamplesBuffer::new(
-                                        channels.try_into().unwrap(),
-                                        sample_rate.try_into().unwrap(),
-                                        samples,
-                                    ));
-                                }
-                            }
-                            DecodeEvent::End => {}
-                            DecodeEvent::Error(error) => eprintln!("decoder error: {error}"),
+                let elapsed = if self.paused {
+                    self.paused_at
+                } else {
+                    self.started_at.elapsed()
+                };
+                loop {
+                    let event = self.pending_events.pop_front().or_else(|| {
+                        match self.receiver.try_recv() {
+                            Ok(event) => Some(event),
+                            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
                         }
+                    });
+                    let Some(event) = event else { break };
+                    match event {
+                        DecodeEvent::Block(block) => self.cache_blocks.push_back(block),
+                        DecodeEvent::End => self.end_received = true,
+                        DecodeEvent::Error(error) => eprintln!("decoder error: {error}"),
                     }
-                    while self
-                        .video_queue
-                        .front()
-                        .is_some_and(|frame| frame.timestamp <= elapsed)
-                    {
-                        self.current_frame = self.video_queue.pop_front().unwrap();
+                }
+                while self
+                    .current_block_frames
+                    .front()
+                    .is_some_and(|frame| frame.timestamp <= elapsed)
+                {
+                    self.current_frame = self.current_block_frames.pop_front().unwrap();
+                }
+                if self.current_block_frames.is_empty() {
+                    if let Some(block) = self.cache_blocks.pop_front() {
+                        self.current_block_frames = block.frames.into_iter().collect();
+                        self.queue_audio(block.audio);
                     }
+                }
+                if let Some(renderer) = &mut self.renderer {
                     renderer.upload_frame(&self.current_frame.image);
                     renderer.render();
+                }
+                if self.end_received
+                    && self.current_block_frames.is_empty()
+                    && self.cache_blocks.is_empty()
+                {
+                    event_loop.exit();
                 }
             }
             WindowEvent::MouseInput {
@@ -677,6 +745,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -684,9 +753,26 @@ impl ApplicationHandler for App {
     }
 }
 
+impl App {
+    fn queue_audio(&self, audio: Vec<AudioChunk>) {
+        if let Some(player) = &self.audio_player {
+            for chunk in audio {
+                player.append(SamplesBuffer::new(
+                    chunk.channels.try_into().unwrap(),
+                    chunk.sample_rate.try_into().unwrap(),
+                    chunk.samples,
+                ));
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let color_space = ColorSpace::BT709;
-    let (receiver, current_frame, pending_events) = start_stream("output.mkv")?;
+    let (receiver, mut first_block, pending_events) = start_stream("output.mkv")?;
+    let current_frame = first_block.frames.remove(0);
+    let current_block_frames = first_block.frames.into_iter().collect();
+    let initial_audio = first_block.audio;
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut App {
         window: None,
@@ -694,13 +780,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         receiver,
         pending_events,
         current_frame,
-        video_queue: VecDeque::new(),
+        current_block_frames,
+        cache_blocks: VecDeque::new(),
+        initial_audio,
         color_space,
         audio_output: None,
         audio_player: None,
         started_at: Instant::now(),
         paused_at: Duration::ZERO,
         paused: false,
+        end_received: false,
     })?;
 
     Ok(())
