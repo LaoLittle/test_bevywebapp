@@ -586,7 +586,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
             event_loop
-                .create_window(Window::default_attributes().with_title("CPU YUV420 -> wgpu RGBA"))
+                .create_window(Window::default_attributes().with_title("Playing MKV video (av1 + pcm_s16le)"))
                 .expect("failed to create window"),
         );
         let renderer = pollster::block_on(Renderer::new(
