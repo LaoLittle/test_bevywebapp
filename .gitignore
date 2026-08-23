@@ -1,1 +1,10 @@
 .DS_Store
+
+
+# Added by cargo
+
+/target
+input.m4v
+output.mkv
+Still_001_001.png
+Cargo.lock

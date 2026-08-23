@@ -1,0 +1,16 @@
+[package]
+name = "test_bevywebapp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = "1.25.2"
+image = "0.25.10"
+pollster = "1.0.1"
+rav1d = { git = "https://github.com/memorysafety/rav1d.git" }
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+oxideav-mkv = { path = "oxideav-mkv" }
+oxideav-core = "0.1"
+rodio = "0.22.2"
