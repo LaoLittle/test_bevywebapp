@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
+use std::error::Error;
 use std::fs::File;
+
+use miette::miette;
 use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
@@ -767,9 +770,10 @@ impl App {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn _main() -> Result<(), Box<dyn Error>> {
+    let arg = std::env::args().nth(1).ok_or("No input file provided")?;
     let color_space = ColorSpace::BT709;
-    let (receiver, mut first_block, pending_events) = start_stream("output.mkv")?;
+    let (receiver, mut first_block, pending_events) = start_stream(&arg)?;
     let current_frame = first_block.frames.remove(0);
     let current_block_frames = first_block.frames.into_iter().collect();
     let initial_audio = first_block.audio;
@@ -791,6 +795,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         paused: false,
         end_received: false,
     })?;
+
+    Ok(())
+}
+
+/*
+You can derive a `Diagnostic` from any `std::error::Error` type.
+
+`thiserror` is a great way to define them, and plays nicely with `miette`!
+*/
+use miette::{Diagnostic, NamedSource, SourceSpan};
+use thiserror::Error;
+
+#[derive(Error, Debug, Diagnostic)]
+#[error("oops!")]
+#[diagnostic(
+    code(oops::my::bad),
+    url(docsrs),
+    help("try doing it better next time?")
+)]
+struct MyBad {
+    // The Source that we're gonna be printing snippets out of.
+    // This can be a String if you don't have or care about file names.
+    #[source_code]
+    src: NamedSource<String>,
+    // Snippets and highlights can be included in the diagnostic!
+    #[label("今天星期二")]
+    bad_bit: SourceSpan,
+}
+
+/*
+Now let's define a function!
+
+Use this `Result` type (or its expanded version) as the return type
+throughout your app (but NOT your libraries! Those should always return
+concrete types!).
+*/
+use miette::Result;
+fn this_fails() -> Result<()> {
+    // You can use plain strings as a `Source`, or anything that implements
+    // the one-method `Source` trait.
+    let src = "505050\n  v我50\n    505050".to_string();
+
+    Err(MyBad {
+        src: NamedSource::new("bad_file.rs", src),
+        bad_bit: (9, 4).into(),
+    })?;
+
+    Ok(())
+}
+
+/*
+Now to get everything printed nicely, just return a `Result<()>`
+and you're all set!
+
+Note: You can swap out the default reporter for a custom one using
+`miette::set_hook()`
+*/
+fn pretend_this_is_main() -> Result<()> {
+    // kaboom~
+    this_fails()?;
+
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let r = pretend_this_is_main();
+
+    println!("{:?}", r);
 
     Ok(())
 }
