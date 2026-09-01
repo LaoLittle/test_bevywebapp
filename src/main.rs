@@ -2,15 +2,17 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fs::File;
 
-use miette::miette;
-use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use oxideav_core::{Demuxer, NullCodecResolver};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
 use rav1d::{Decoder as Av1Decoder, PlanarImageComponent, Rav1dError, Settings};
+use opus_rs::OpusDecoder as OpusDecode;
 use rayon::{join, prelude::*};
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, buffer::SamplesBuffer};
 use wgpu::util::DeviceExt;
@@ -24,17 +26,11 @@ use winit::{
 
 #[derive(Clone, Copy)]
 pub struct ColorSpace {
-    pub rgb_to_yuv: [[f32; 3]; 3],
     pub yuv_to_rgb: [[f32; 3]; 3],
 }
 
 impl ColorSpace {
     pub const BT601: Self = Self {
-        rgb_to_yuv: [
-            [0.299, 0.587, 0.114],
-            [-0.168736, -0.331264, 0.5],
-            [0.5, -0.418688, -0.081312],
-        ],
         yuv_to_rgb: [
             [1.0, 0.0, 1.402],
             [1.0, -0.344136, -0.714136],
@@ -43,11 +39,6 @@ impl ColorSpace {
     };
 
     pub const BT709: Self = Self {
-        rgb_to_yuv: [
-            [0.2126, 0.7152, 0.0722],
-            [-0.114572, -0.385428, 0.5],
-            [0.5, -0.454153, -0.045847],
-        ],
         yuv_to_rgb: [
             [1.0, 0.0, 1.5748],
             [1.0, -0.187324, -0.468124],
@@ -56,11 +47,6 @@ impl ColorSpace {
     };
 
     pub const BT2020: Self = Self {
-        rgb_to_yuv: [
-            [0.2627, 0.678, 0.0593],
-            [-0.13963, -0.36037, 0.5],
-            [0.5, -0.459786, -0.040214],
-        ],
         yuv_to_rgb: [
             [1.0, 0.0, 1.4746],
             [1.0, -0.16455, -0.57135],
@@ -68,9 +54,8 @@ impl ColorSpace {
         ],
     };
 
-    pub fn custom(rgb_to_yuv: [[f32; 3]; 3], yuv_to_rgb: [[f32; 3]; 3]) -> Self {
+    pub fn custom(yuv_to_rgb: [[f32; 3]; 3]) -> Self {
         Self {
-            rgb_to_yuv,
             yuv_to_rgb,
         }
     }
@@ -188,54 +173,103 @@ impl Yuv420Image {
     }
 }
 
+fn select_color_space_from_metadata() -> ColorSpace {
+    ColorSpace::BT709
+}
+
+fn decode_opus_packet(
+    decoder: &mut OpusDecode,
+    packet_data: &[u8],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<Vec<f32>, String> {
+    let frame_size = (sample_rate / 1000 * 120) as usize;
+    let mut decoded = vec![0.0; frame_size * channels as usize];
+    let actual = decoder
+        .decode(packet_data, frame_size, &mut decoded)
+        .map_err(|error| format!("opus decode failed: {error}"))?;
+    decoded.truncate(actual * channels as usize);
+    Ok(decoded)
+}
+
 fn send_picture(
     frames: &mut Vec<VideoFrame>,
     picture: rav1d::Picture,
-    time_base: oxideav_core::TimeBase,
+    timebase_num: u32,
+    timebase_den: u32,
     first_timestamp: &mut Option<Duration>,
 ) {
-    let timestamp = Duration::from_secs_f64(
-        time_base
-            .seconds_of(picture.timestamp().unwrap_or(0))
-            .max(0.0),
-    );
-    let first = *first_timestamp.get_or_insert(timestamp);
+    let timestamp = picture.timestamp().unwrap_or(0);
+    let secs_f64 = (timestamp as f64 * timebase_num as f64) / timebase_den as f64;
+    let duration = Duration::from_secs_f64(secs_f64.max(0.0));
+    let first = *first_timestamp.get_or_insert(duration);
     frames.push(VideoFrame {
-        timestamp: timestamp.saturating_sub(first),
+        timestamp: duration.saturating_sub(first),
         image: Yuv420Image::from_picture(&picture),
     });
 }
 
 fn start_stream(
     path: &str,
-) -> Result<(Receiver<DecodeEvent>, CacheBlock, VecDeque<DecodeEvent>), Box<dyn std::error::Error>>
+) -> Result<(Receiver<DecodeEvent>, CacheBlock, VecDeque<DecodeEvent>, ColorSpace), Box<dyn std::error::Error>>
 {
-    let input = BufReader::new(File::open(path)?);
-    let mut demuxer = oxideav_mkv::demux::open_typed(Box::new(input), &NullCodecResolver)?;
-    let streams = demuxer.streams().to_vec();
-    let video_stream = streams
-        .iter()
-        .find(|stream| stream.params.codec_id.as_str() == "av1")
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "AV1 video stream not found",
-            )
-        })?;
-    let audio_stream = streams
-        .iter()
-        .find(|stream| stream.params.codec_id.as_str() == "pcm_s16le");
-    let video_index = video_stream.index;
-    let video_time_base = video_stream.time_base;
-    let audio_index = audio_stream.map(|stream| stream.index);
-    let audio_channels = audio_stream
-        .and_then(|stream| stream.params.channels)
-        .unwrap_or(2);
-    let audio_rate = audio_stream
-        .and_then(|stream| stream.params.sample_rate)
-        .unwrap_or(48_000);
+    let file = File::open(path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mkv");
+    
+    let probed = symphonia::default::get_probe().probe(
+        &hint,
+        mss,
+        FormatOptions::default(),
+        MetadataOptions::default(),
+    )?;
+    let mut format = probed;
+    
+    let mut video_track_id = None;
+    let mut audio_track_id = None;
+    let mut video_timebase = (1u32, 1u32);
+    let mut audio_channels = 2u16;
+    let mut audio_rate = 48_000u32;
+    let mut audio_codec = String::from("pcm_s16le");
+    
+    use symphonia::core::codecs::audio::well_known as audio_codecs;
+    use symphonia::core::codecs::video::well_known as video_codecs;
+    
+    for track in format.tracks() {
+        if let Some(params) = &track.codec_params {
+            if params.is_video() {
+                if let Some(vp) = params.video() {
+                    if vp.codec == video_codecs::CODEC_ID_AV1 {
+                        video_track_id = Some(track.id);
+                        if let Some(tb) = track.time_base {
+                            video_timebase = (tb.numer.get(), tb.denom.get());
+                        }
+                    }
+                }
+            } else if params.is_audio() {
+                if let Some(ap) = params.audio() {
+                    if ap.codec == audio_codecs::CODEC_ID_OPUS {
+                        audio_track_id = Some(track.id);
+                        audio_codec = "opus".to_string();
+                        audio_rate = ap.sample_rate.unwrap_or(48_000);
+                        audio_channels = ap.channels.as_ref().map(|c| c.count() as u16).unwrap_or(2);
+                    } else if ap.codec == audio_codecs::CODEC_ID_PCM_S16LE && audio_track_id.is_none() {
+                        audio_track_id = Some(track.id);
+                        audio_codec = "pcm_s16le".to_string();
+                        audio_rate = ap.sample_rate.unwrap_or(48_000);
+                        audio_channels = ap.channels.as_ref().map(|c| c.count() as u16).unwrap_or(2);
+                    }
+                }
+            }
+        }
+    }
+    
+    let video_track_id = video_track_id.ok_or("AV1 video stream not found")?;
+    let color_space = select_color_space_from_metadata();
     let (sender, receiver) = sync_channel(4);
     let decode_sender = sender.clone();
+    
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             let mut settings = Settings::new();
@@ -243,6 +277,14 @@ fn start_stream(
             settings.set_max_frame_delay(CACHE_BLOCK_FRAMES as u32);
             let mut decoder =
                 Av1Decoder::with_settings(&settings).map_err(|error| error.to_string())?;
+            let mut opus_decoder = if audio_codec.as_str() == "opus" {
+                Some(
+                    OpusDecode::new(audio_rate as i32, audio_channels as usize)
+                        .map_err(|error| format!("opus init failed: {error}"))?,
+                )
+            } else {
+                None
+            };
             let mut first_timestamp = None;
             let mut block_frames = Vec::with_capacity(CACHE_BLOCK_FRAMES);
             let mut block_audio = Vec::new();
@@ -259,51 +301,67 @@ fn start_stream(
                     }
                     Ok(())
                 };
+            
             loop {
-                let packet = match demuxer.next_packet() {
-                    Ok(packet) => packet,
-                    Err(_) => break,
-                };
-                if packet.stream_index == video_index {
-                    let timestamp = packet.pts.unwrap_or(0);
-                    let mut send_result = decoder.send_data(
-                        packet.data.into_boxed_slice(),
-                        None,
-                        Some(timestamp),
-                        packet.duration,
-                    );
-                    loop {
-                        while let Ok(picture) = decoder.get_picture() {
-                            send_picture(
-                                &mut block_frames,
-                                picture,
-                                video_time_base,
-                                &mut first_timestamp,
+                match format.next_packet() {
+                    Ok(Some(packet)) => {
+                        if packet.track_id == video_track_id {
+                            let mut send_result = decoder.send_data(
+                                packet.data.to_vec().into_boxed_slice(),
+                                None,
+                                Some(packet.pts.get()),
+                                Some(packet.dur.get() as i64),
                             );
+                            loop {
+                                while let Ok(picture) = decoder.get_picture() {
+                                    send_picture(
+                                        &mut block_frames,
+                                        picture,
+                                        video_timebase.0,
+                                        video_timebase.1,
+                                        &mut first_timestamp,
+                                    );
+                                    if block_frames.len() >= CACHE_BLOCK_FRAMES {
+                                        flush_block(&mut block_frames, &mut block_audio)?;
+                                    }
+                                }
+                                match send_result {
+                                    Ok(()) => break,
+                                    Err(Rav1dError::TryAgain) => send_result = decoder.send_pending_data(),
+                                    Err(error) => return Err(error.to_string()),
+                                }
+                            }
+                        } else if audio_track_id == Some(packet.track_id) {
+                            let samples = match audio_codec.as_str() {
+                                "opus" => {
+                                    let decoder = opus_decoder
+                                        .as_mut()
+                                        .expect("opus decoder should be initialized");
+                                    decode_opus_packet(
+                                        decoder,
+                                        &packet.data,
+                                        audio_rate,
+                                        audio_channels,
+                                    )?
+                                }
+                                _ => packet
+                                    .data
+                                    .par_chunks_exact(2)
+                                    .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0)
+                                    .collect(),
+                            };
+                            block_audio.push(AudioChunk {
+                                channels: audio_channels,
+                                sample_rate: audio_rate,
+                                samples,
+                            });
                             if block_frames.len() >= CACHE_BLOCK_FRAMES {
                                 flush_block(&mut block_frames, &mut block_audio)?;
                             }
                         }
-                        match send_result {
-                            Ok(()) => break,
-                            Err(Rav1dError::TryAgain) => send_result = decoder.send_pending_data(),
-                            Err(error) => return Err(error.to_string()),
-                        }
                     }
-                } else if audio_index == Some(packet.stream_index) {
-                    let samples = packet
-                        .data
-                        .par_chunks_exact(2)
-                        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0)
-                        .collect();
-                    block_audio.push(AudioChunk {
-                        channels: audio_channels,
-                        sample_rate: audio_rate,
-                        samples,
-                    });
-                    if block_frames.len() >= CACHE_BLOCK_FRAMES {
-                        flush_block(&mut block_frames, &mut block_audio)?;
-                    }
+                    Ok(None) => break,
+                    Err(error) => return Err(format!("demux error: {error}")),
                 }
             }
             decoder.flush();
@@ -311,7 +369,8 @@ fn start_stream(
                 send_picture(
                     &mut block_frames,
                     picture,
-                    video_time_base,
+                    video_timebase.0,
+                    video_timebase.1,
                     &mut first_timestamp,
                 );
             }
@@ -333,7 +392,7 @@ fn start_stream(
             DecodeEvent::Error(error) => return Err(error.into()),
         }
     };
-    Ok((receiver, first_block, pending_events))
+    Ok((receiver, first_block, pending_events, color_space))
 }
 
 struct Renderer {
@@ -770,10 +829,9 @@ impl App {
     }
 }
 
-fn _main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let arg = std::env::args().nth(1).ok_or("No input file provided")?;
-    let color_space = ColorSpace::BT709;
-    let (receiver, mut first_block, pending_events) = start_stream(&arg)?;
+    let (receiver, mut first_block, pending_events, color_space) = start_stream(&arg)?;
     let current_frame = first_block.frames.remove(0);
     let current_block_frames = first_block.frames.into_iter().collect();
     let initial_audio = first_block.audio;
@@ -795,74 +853,6 @@ fn _main() -> Result<(), Box<dyn Error>> {
         paused: false,
         end_received: false,
     })?;
-
-    Ok(())
-}
-
-/*
-You can derive a `Diagnostic` from any `std::error::Error` type.
-
-`thiserror` is a great way to define them, and plays nicely with `miette`!
-*/
-use miette::{Diagnostic, NamedSource, SourceSpan};
-use thiserror::Error;
-
-#[derive(Error, Debug, Diagnostic)]
-#[error("oops!")]
-#[diagnostic(
-    code(oops::my::bad),
-    url(docsrs),
-    help("try doing it better next time?")
-)]
-struct MyBad {
-    // The Source that we're gonna be printing snippets out of.
-    // This can be a String if you don't have or care about file names.
-    #[source_code]
-    src: NamedSource<String>,
-    // Snippets and highlights can be included in the diagnostic!
-    #[label("今天星期二")]
-    bad_bit: SourceSpan,
-}
-
-/*
-Now let's define a function!
-
-Use this `Result` type (or its expanded version) as the return type
-throughout your app (but NOT your libraries! Those should always return
-concrete types!).
-*/
-use miette::Result;
-fn this_fails() -> Result<()> {
-    // You can use plain strings as a `Source`, or anything that implements
-    // the one-method `Source` trait.
-    let src = "505050\n  v我50\n    505050".to_string();
-
-    Err(MyBad {
-        src: NamedSource::new("bad_file.rs", src),
-        bad_bit: (9, 4).into(),
-    })?;
-
-    Ok(())
-}
-
-/*
-Now to get everything printed nicely, just return a `Result<()>`
-and you're all set!
-
-Note: You can swap out the default reporter for a custom one using
-`miette::set_hook()`
-*/
-fn pretend_this_is_main() -> Result<()> {
-    // kaboom~
-    this_fails()?;
-
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let r = pretend_this_is_main();
-
-    println!("{:?}", r);
 
     Ok(())
 }
